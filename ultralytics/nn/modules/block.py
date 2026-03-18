@@ -2067,30 +2067,51 @@ class RealNVP(nn.Module):
         z, log_det = self.backward_p(x)
         return self.prior.log_prob(z) + log_det
 
-class StarBlock(nn.Module):
-    # c1: 输入通道, c2: 输出通道
-    def __init__(self, c1, c2):
+class StarBlockSingle(nn.Module):
+    # StarNet中的基础构建块
+    def __init__(self, c1, c2, shortcut=True):
         super().__init__()
-        # YOLO 的 parse_model 遇到 n>1 时，第一个 block 传入 (c1, c2)
-        # 后续的 block 会自动传入 (c2, c2)。
+        # 使用 YOLO 官方的 Conv，自动包含 Conv2d + BatchNorm2d + SiLU
+        # 参数顺序: 输入通道, 输出通道, 卷积核大小, 步长(默认为1), 分组数(g)
+        self.dwconv1 = Conv(c1, c1, 3, g=c1)  # DWConv 深度可分离卷积
         
-        # DWConv: Depthwise Separable Convolution
-        self.dwconv1 = nn.Conv2d(c1, c1, kernel_size=3, padding=1, groups=c1)
+        # 全连接层分支 (用1x1卷积实现)
+        self.fc1 = Conv(c1, c1, 1)
+        self.fc2 = Conv(c1, c1, 1)
+        self.fc3 = Conv(c1, c1, 1)
         
-        # FC layers (1x1 Convs in spatial maps)
-        self.fc1 = nn.Conv2d(c1, c1, kernel_size=1)
-        self.fc2 = nn.Conv2d(c1, c1, kernel_size=1)
-        self.fc3 = nn.Conv2d(c1, c1, kernel_size=1)
-        
-        self.dwconv2 = nn.Conv2d(c1, c2, kernel_size=3, padding=1, groups=1)
+        # 输出层
+        self.dwconv2 = Conv(c1, c2, 3)
+
+        # 判断是否启用残差连接：只有当输入输出通道数一致时，才能相加
+        self.add_shortcut = shortcut and c1 == c2
 
     def forward(self, x):
         out = self.dwconv1(x)
-        # Star Operation: 两个分支的元素级相乘 [cite: 247]
+        # Star Operation: 两个分支的元素级相乘
         out = self.fc1(out) * self.fc2(out) 
         out = self.fc3(out)
         out = self.dwconv2(out)
-        return out
+        
+        # 残差连接：如果通道数匹配，就执行 x + out；否则直接输出 out
+        return x + out if self.add_shortcut else out
+
+
+# 2. YOLO 解析包装器
+class StarBlock(nn.Module):
+    """
+    接收 YOLO 的参数并重复堆叠基础模块
+    """
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5, *args, **kwargs):
+        super().__init__()
+        
+        # 顺次堆叠 n 次，并传入 shortcut 参数
+        self.m = nn.Sequential(*(
+            StarBlockSingle(c1 if i == 0 else c2, c2, shortcut=shortcut) for i in range(n)
+        ))
+
+    def forward(self, x):
+        return self.m(x)
 class MLCA(nn.Module):
     def __init__(self, c, k_size=5):
         super().__init__()
