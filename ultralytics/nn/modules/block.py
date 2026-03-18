@@ -2,6 +2,7 @@
 """Block modules."""
 
 from __future__ import annotations
+import math
 
 import torch
 import torch.nn as nn
@@ -2065,3 +2066,86 @@ class RealNVP(nn.Module):
             self.float()
         z, log_det = self.backward_p(x)
         return self.prior.log_prob(z) + log_det
+
+class StarBlock(nn.Module):
+    # c1: 输入通道, c2: 输出通道
+    def __init__(self, c1, c2):
+        super().__init__()
+        # YOLO 的 parse_model 遇到 n>1 时，第一个 block 传入 (c1, c2)
+        # 后续的 block 会自动传入 (c2, c2)。
+        
+        # DWConv: Depthwise Separable Convolution
+        self.dwconv1 = nn.Conv2d(c1, c1, kernel_size=3, padding=1, groups=c1)
+        
+        # FC layers (1x1 Convs in spatial maps)
+        self.fc1 = nn.Conv2d(c1, c1, kernel_size=1)
+        self.fc2 = nn.Conv2d(c1, c1, kernel_size=1)
+        self.fc3 = nn.Conv2d(c1, c1, kernel_size=1)
+        
+        self.dwconv2 = nn.Conv2d(c1, c2, kernel_size=3, padding=1, groups=1)
+
+    def forward(self, x):
+        out = self.dwconv1(x)
+        # Star Operation: 两个分支的元素级相乘 [cite: 247]
+        out = self.fc1(out) * self.fc2(out) 
+        out = self.fc3(out)
+        out = self.dwconv2(out)
+        return out
+class MLCA(nn.Module):
+    def __init__(self, c, k_size=5):
+        super().__init__()
+        self.k_size = k_size
+        
+        # 根据等式(3)计算自适应卷积核大小 k
+        b, gamma = 2, 2
+        k = int(abs((math.log2(c) / gamma) + b / gamma))
+        k = k if k % 2 else k + 1 # 保证奇数 [cite: 293]
+        
+        self.conv1d = nn.Conv1d(1, 1, kernel_size=k, padding=(k - 1) // 2, bias=False)
+
+    def forward(self, x):
+        b, c, h, w = x.size()
+        
+        # Local Average Pooling (LAP) [cite: 284]
+        lap = F.avg_pool2d(x, self.k_size, stride=self.k_size)
+        
+        # Global Average Pooling (GAP) 分支 [cite: 285]
+        gap = F.adaptive_avg_pool2d(lap, 1)
+        gap_reshaped = gap.squeeze(-1).transpose(-1, -2) # (b, 1, c)
+        
+        # Conv1d 压缩通道特征 [cite: 286]
+        attn = self.conv1d(gap_reshaped).transpose(-1, -2).unsqueeze(-1) # (b, c, 1, 1)
+        
+        # 恢复原始空间维度并与原特征相乘 (Unpooling) [cite: 340]
+        attn = F.interpolate(attn, size=(h, w), mode='nearest')
+        
+        return x * torch.sigmoid(attn)
+
+class Bottleneck_MLCA(nn.Module):
+    # 将 MLCA 集成到传统的 Bottleneck 中
+    def __init__(self, c1, c2, shortcut=True, g=1, k=(3, 3), e=0.5):
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, k[0], 1) # YOLO 标准的 Conv (包含 BN + SiLU)
+        self.cv2 = Conv(c_, c2, k[1], 1, g=g)
+        self.mlca = MLCA(c2)
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x):
+        out = self.mlca(self.cv2(self.cv1(x)))
+        return x + out if self.add else out
+
+class C2f_MLCA(nn.Module):
+    # C2f-MLCA 模块实现
+    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):
+        super().__init__()
+        self.c = int(c2 * e)
+        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
+        self.cv2 = Conv((2 + n) * self.c, c2, 1)
+        # 替换标准的 Bottleneck 为 Bottleneck_MLCA
+        self.m = nn.ModuleList(Bottleneck_MLCA(self.c, self.c, shortcut, g, k=(3, 3), e=1.0) for _ in range(n))
+
+    def forward(self, x):
+        y = list(self.cv1(x).chunk(2, 1))
+        y.extend(m(y[-1]) for m in self.m)
+        return self.cv2(torch.cat(y, 1))
